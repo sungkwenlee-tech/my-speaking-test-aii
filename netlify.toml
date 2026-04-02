@@ -1,0 +1,18 @@
+# https://svelte.dev/docs/kit/adapter-netlify
+[build]
+command = "npm run build"
+publish = "build"
+
+# Netlify UI often sets Functions → netlify/functions. Folder must exist (can be empty).
+# SvelteKit SSR still uses .netlify/functions-internal from the adapter.
+[functions]
+directory = "netlify/functions"
+
+[build.environment]
+NODE_VERSION = "20"
+# Netlify sometimes sets production install; vite & adapter-netlify live in devDependencies.
+NPM_CONFIG_PRODUCTION = "false"
+
+# After first deploy, add your URL to Supabase:
+# Authentication → URL configuration → Site URL + Redirect URLs
+# e.g. https://YOUR_SITE.netlify.app and https://YOUR_SITE.netlify.app/auth/callback
