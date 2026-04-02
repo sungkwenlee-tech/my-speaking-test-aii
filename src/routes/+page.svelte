@@ -1,6 +1,8 @@
 <script>
 	import { onDestroy } from 'svelte';
 	import { resolve } from '$app/paths';
+	import { get } from 'svelte/store';
+	import { locale, t } from '$lib/i18n/locale.js';
 
 	let recording = $state(false);
 	let audioBlob = $state(/** @type {Blob | null} */ (null));
@@ -61,10 +63,11 @@
 			}, 250);
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
+			const loc = get(locale);
 			error =
 				msg.includes('Permission') || msg.includes('NotAllowed')
-					? '마이크 사용이 거부되었습니다. 브라우저 설정에서 마이크를 허용해 주세요.'
-					: `녹음을 시작할 수 없습니다: ${msg}`;
+					? t(loc, 'home.micDenied')
+					: `${t(loc, 'home.recStartFail')}: ${msg}`;
 			stopStream();
 		}
 	}
@@ -114,7 +117,7 @@
 </script>
 
 <svelte:head>
-	<title>음성 녹음</title>
+	<title>{t($locale, 'home.title')}</title>
 </svelte:head>
 
 <div
@@ -122,15 +125,22 @@
 >
 	<div class="w-full max-w-md space-y-8">
 		<header class="text-center space-y-2">
-			<h1 class="text-2xl font-semibold tracking-tight text-neutral-100">음성 녹음</h1>
-			<p class="text-sm text-zinc-400">마이크로 녹음한 뒤 재생해 내용을 확인하세요.</p>
+			<h1 class="text-2xl font-semibold tracking-tight text-neutral-100">{t($locale, 'home.title')}</h1>
+			<p class="text-sm text-zinc-400">{t($locale, 'home.subtitle')}</p>
 			<p class="text-xs text-zinc-600">
-				실시간 음성 채팅이 필요하면
+				{t($locale, 'home.voiceChatHint')}
 				<a
 					class="underline underline-offset-2 hover:text-zinc-200"
 					href={resolve('/voice-chat')}
 				>
-					여기로 이동
+					{t($locale, 'home.voiceChatLink')}
+				</a>
+				<span class="text-zinc-700"> · </span>
+				<a
+					class="underline underline-offset-2 hover:text-zinc-200"
+					href={resolve('/db-test')}
+				>
+					{t($locale, 'home.dbTestLink')}
 				</a>
 			</p>
 		</header>
@@ -157,7 +167,7 @@
 							: 'bg-zinc-600 hover:bg-zinc-500 ring-2 ring-zinc-400/40'}"
 						onclick={() => (recording ? stopRecording() : startRecording())}
 						aria-pressed={recording}
-						aria-label={recording ? '녹음 중지' : '녹음 시작'}
+						aria-label={recording ? t($locale, 'home.recStop') : t($locale, 'home.recStart')}
 					>
 						{#if recording}
 							<span class="h-4 w-4 rounded-sm bg-white" aria-hidden="true"></span>
@@ -172,17 +182,17 @@
 				>
 					<p class="text-sm font-medium tabular-nums min-h-[1.25rem]">
 						{#if recording}
-							<span class="text-red-500">● REC</span>
+							<span class="text-red-500">{t($locale, 'home.recording')}</span>
 							<span class="text-zinc-500"> · </span>
 							<span class="font-mono text-amber-400/95 tabular-nums tracking-wide">{formatTime(elapsedSec)}</span>
 						{:else if audioBlob}
-							<span class="text-zinc-500">완료</span>
+							<span class="text-zinc-500">{t($locale, 'home.done')}</span>
 							<span class="text-zinc-600"> · </span>
 							<span class="font-mono text-amber-500/90 tabular-nums"
 								>{(audioBlob.size / 1024).toFixed(1)} KB</span
 							>
 						{:else}
-							<span class="text-zinc-600">대기 중</span>
+							<span class="text-zinc-600">{t($locale, 'home.waiting')}</span>
 						{/if}
 					</p>
 				</div>
@@ -195,16 +205,16 @@
 
 				{#if audioUrl && !recording}
 					<div class="w-full space-y-3">
-						<p class="text-xs uppercase tracking-wide text-zinc-500 text-center">미리듣기</p>
+						<p class="text-xs uppercase tracking-wide text-zinc-500 text-center">{t($locale, 'home.preview')}</p>
 						<audio class="w-full rounded-lg" controls src={audioUrl} preload="metadata">
-							브라우저가 오디오 재생을 지원하지 않습니다.
+							{t($locale, 'home.noAudio')}
 						</audio>
 						<button
 							type="button"
 							class="w-full rounded-xl border border-zinc-500/50 bg-zinc-800/80 px-4 py-2.5 text-sm font-medium text-zinc-200 hover:bg-zinc-700 transition"
 							onclick={() => clearRecording()}
 						>
-							이 녹음 삭제하고 다시 녹음
+							{t($locale, 'home.clearRec')}
 						</button>
 					</div>
 				{/if}
@@ -212,7 +222,7 @@
 		</div>
 
 		<p class="text-center text-xs text-zinc-600">
-			HTTPS 또는 localhost에서만 마이크 접근이 가능합니다.
+			{t($locale, 'home.micHint')}
 		</p>
 	</div>
 </div>

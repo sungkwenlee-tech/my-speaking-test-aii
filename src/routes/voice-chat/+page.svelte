@@ -7,13 +7,24 @@
 		speakText
 	} from '$lib/voice/browserSpeech.js';
 	import { formatOpenAiErrorForUser } from '$lib/openai/formatOpenAiError.js';
-	import { onDestroy } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import { get } from 'svelte/store';
+	import { locale, t } from '$lib/i18n/locale.js';
+
+	let { data } = $props();
+
+	/** @param {string} key */
+	function T(key) {
+		return t(get(locale), key);
+	}
 
 	/** @typedef {'free' | 'openai'} Engine */
 	let engine = $state(/** @type {Engine} */ ('free'));
 	let ollamaModel = $state('llama3.2');
 	/** Ollama 응답/음성 재생 중에는 음성 인식을 잠시 멈춤 */
 	let freeBusy = $state(false);
+	/** @type {'generating' | 'speaking' | null} */
+	let freePhase = $state(null);
 
 	let status = $state('idle'); // idle | connecting | listening | error
 	let error = $state(/** @type {string | null} */ (null));
@@ -33,6 +44,51 @@
 
 	/** @type {WebSocket | null} */
 	let ws = $state(null);
+
+	/** @type {string | null} */
+	let conversationId = $state(null);
+
+	async function createConversationRow() {
+		try {
+			const r = await fetch('/api/conversations', {
+				method: 'POST',
+				credentials: 'include',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ engine })
+			});
+			if (!r.ok) {
+				conversationId = null;
+				return false;
+			}
+			const j = await r.json();
+			conversationId = typeof j.id === 'string' ? j.id : null;
+			return Boolean(conversationId);
+		} catch {
+			conversationId = null;
+			return false;
+		}
+	}
+
+	/**
+	 * @param {'system' | 'user' | 'assistant'} role
+	 * @param {string} content
+	 */
+	function persistMessage(role, content) {
+		if (!conversationId) return;
+		void fetch(`/api/conversations/${conversationId}/messages`, {
+			method: 'POST',
+			credentials: 'include',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ role, content })
+		});
+	}
+
+	onMount(() => {
+		const de = data.profile?.default_engine;
+		if (de === 'free' || de === 'openai') {
+			engine = de;
+		}
+	});
 
 	// Audio (input + output)
 	const INPUT_SAMPLE_RATE = 24000; // Realtime expects PCM16 at 24kHz
@@ -56,13 +112,8 @@
 	/** WebSocket이 닫혀도 방금 Realtime error 이벤트가 있었다면 status를 idle로 덮어쓰지 않음 */
 	let keepErrorUiOnWsClose = false;
 
-	const SYSTEM_CONNECTED_OPENAI =
-		'영어 회화 AI에 연결되었습니다! 자유롭게 대화해보세요.';
-	const SYSTEM_CONNECTED_FREE =
-		'무료 모드입니다. 영어로 말하면 로컬 Ollama가 답하고 브라우저가 읽어 줍니다. 스피커 대신 이어폰을 권장합니다.';
-
 	const OLLAMA_TUTOR_SYSTEM =
-		'You are a friendly English conversation tutor. Help the user practice spoken English: respond in clear, natural English, keep replies concise unless they ask for more, and gently correct major mistakes when helpful.';
+		'You are a friendly English conversation tutor. Help the user practice spoken English: respond in clear, natural English. For voice chat, keep almost every reply to 2–4 short sentences unless the user explicitly asks for a long explanation. Gently correct major mistakes when helpful.';
 
 	function formatTime(ts) {
 		return new Date(ts).toLocaleTimeString('ko-KR', {
@@ -76,7 +127,7 @@
 	function clearHistory() {
 		streamingText = '';
 		if (status === 'listening') {
-			const sys = engine === 'free' ? SYSTEM_CONNECTED_FREE : SYSTEM_CONNECTED_OPENAI;
+			const sys = engine === 'free' ? T('vc.systemFree') : T('vc.systemOpenai');
 			messages = [{ role: 'system', text: sys, ts: Date.now() }];
 		} else {
 			messages = [];
@@ -127,11 +178,14 @@
 		const trimmed = text.trim();
 		if (!trimmed || status !== 'listening' || engine !== 'free') {
 			freeBusy = false;
+			freePhase = null;
 			startRecognitionSafe();
 			return;
 		}
 
 		freeBusy = true;
+		freePhase = 'generating';
+		streamingText = '';
 		try {
 			recognition?.stop();
 		} catch {
@@ -139,6 +193,7 @@
 		}
 
 		messages = [...messages, { role: 'user', text: trimmed, ts: Date.now() }];
+		persistMessage('user', trimmed);
 
 		try {
 			const resp = await fetch('/api/chat/ollama', {
@@ -146,27 +201,73 @@
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					messages: buildOllamaMessages(),
-					model: ollamaModel
+					model: ollamaModel,
+					stream: true
 				})
 			});
-			const data = await resp.json();
 			if (!resp.ok) {
+				const data = await resp.json().catch(() => ({}));
 				throw new Error(typeof data?.error === 'string' ? data.error : 'Ollama 요청 실패');
 			}
-			const reply = typeof data?.text === 'string' ? data.text : '';
-			if (!reply) throw new Error('빈 응답입니다.');
+			const body = resp.body;
+			if (!body) throw new Error('응답 스트림이 없습니다.');
 
+			const reader = body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			let reply = '';
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				for (;;) {
+					const nl = buffer.indexOf('\n');
+					if (nl < 0) break;
+					const line = buffer.slice(0, nl).trim();
+					buffer = buffer.slice(nl + 1);
+					if (!line) continue;
+					try {
+						const j = JSON.parse(line);
+						const piece = j?.message?.content;
+						if (typeof piece === 'string' && piece.length) {
+							reply += piece;
+							streamingText = reply;
+						}
+					} catch {
+						// ignore malformed chunk
+					}
+				}
+			}
+			buffer += decoder.decode();
+			if (buffer.trim()) {
+				try {
+					const j = JSON.parse(buffer.trim());
+					const piece = j?.message?.content;
+					if (typeof piece === 'string' && piece.length) reply += piece;
+				} catch {
+					// ignore
+				}
+			}
+
+			if (!reply.trim()) throw new Error('빈 응답입니다.');
+
+			streamingText = '';
 			messages = [...messages, { role: 'assistant', text: reply, ts: Date.now() }];
+			persistMessage('assistant', reply);
 			error = null;
+			freePhase = 'speaking';
 			speakText(reply, {
 				lang: 'en-US',
 				onEnd: () => {
 					freeBusy = false;
+					freePhase = null;
 					startRecognitionSafe();
 				}
 			});
 		} catch (e) {
+			streamingText = '';
 			freeBusy = false;
+			freePhase = null;
 			error = e instanceof Error ? e.message : String(e);
 			errorHelpUrl = null;
 			startRecognitionSafe();
@@ -229,7 +330,9 @@
 			);
 		}
 		status = 'listening';
-		messages = [{ role: 'system', text: SYSTEM_CONNECTED_FREE, ts: Date.now() }];
+		const sysFree = T('vc.systemFree');
+		messages = [{ role: 'system', text: sysFree, ts: Date.now() }];
+		persistMessage('system', sysFree);
 	}
 
 	function float32ToPCM16Base64(float32) {
@@ -392,9 +495,12 @@
 		cancelSpeech();
 		stopFreeRecognition();
 		freeBusy = false;
+		freePhase = null;
+		conversationId = null;
 
 		if (engine === 'free') {
 			try {
+				await createConversationRow();
 				startFree();
 			} catch (e) {
 				const msg = e instanceof Error ? e.message : String(e);
@@ -406,6 +512,7 @@
 		}
 
 		try {
+			await createConversationRow();
 			const resp = await fetch('/api/realtime/session', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -436,7 +543,9 @@
 				await ensureAudio();
 				status = 'listening';
 				await startMicStreaming();
-				messages = [...messages, { role: 'system', text: SYSTEM_CONNECTED_OPENAI, ts: Date.now() }];
+				const sysOpen = T('vc.systemOpenai');
+				messages = [...messages, { role: 'system', text: sysOpen, ts: Date.now() }];
+				persistMessage('system', sysOpen);
 			};
 
 			ws.onmessage = (ev) => {
@@ -478,6 +587,7 @@
 					if (msg.response_id) currentResponseId = msg.response_id;
 					const text = msg.text ?? streamingText ?? '';
 					messages = [...messages, { role: 'assistant', text, ts: Date.now() }];
+					persistMessage('assistant', text);
 					streamingText = '';
 					return;
 				}
@@ -561,6 +671,7 @@
 		errorHelpUrl = null;
 		keepErrorUiOnWsClose = false;
 		freeBusy = false;
+		freePhase = null;
 		clearPlayback();
 		cancelSpeech();
 		stopFreeRecognition();
@@ -596,7 +707,7 @@
 </script>
 
 <svelte:head>
-	<title>실시간 영어회화 AI</title>
+	<title>{t($locale, 'vc.pageTitle')}</title>
 </svelte:head>
 
 <div
@@ -605,19 +716,19 @@
 	<div class="w-full max-w-lg space-y-8">
 		<header class="text-center space-y-3">
 			<h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
-				실시간 영어회화 AI
+				{t($locale, 'vc.title')}
 			</h1>
 			<p class="text-sm sm:text-base text-slate-600">
 				{#if engine === 'free'}
-					브라우저 음성 인식 + 로컬 Ollama로 연습합니다. OpenAI 결제 없이 사용할 수 있어요.
+					{t($locale, 'vc.subFree')}
 				{:else}
-					OpenAI Realtime API로 자연스러운 영어 대화를 연습해보세요
+					{t($locale, 'vc.subOpenai')}
 				{/if}
 			</p>
 			<div
 				class="flex rounded-xl bg-slate-100/90 p-1 text-xs sm:text-sm font-medium border border-slate-200/80"
 				role="group"
-				aria-label="대화 엔진 선택"
+				aria-label={t($locale, 'vc.engineGroup')}
 			>
 				<button
 					type="button"
@@ -627,7 +738,7 @@
 					disabled={status === 'connecting' || status === 'listening'}
 					onclick={() => (engine = 'free')}
 				>
-					무료 · Ollama
+					{t($locale, 'vc.engineFree')}
 				</button>
 				<button
 					type="button"
@@ -637,7 +748,7 @@
 					disabled={status === 'connecting' || status === 'listening'}
 					onclick={() => (engine = 'openai')}
 				>
-					OpenAI · 유료
+					{t($locale, 'vc.engineOpenai')}
 				</button>
 			</div>
 		</header>
@@ -659,7 +770,9 @@
 							class="relative flex h-32 w-32 sm:h-36 sm:w-36 items-center justify-center rounded-full bg-white text-slate-700 transition hover:bg-slate-50 disabled:opacity-60 disabled:cursor-not-allowed"
 							disabled={status === 'connecting' || status === 'listening'}
 							onclick={() => start()}
-							aria-label={status === 'idle' || status === 'error' ? '연결하고 대화 시작' : '마이크'}
+							aria-label={status === 'idle' || status === 'error'
+								? t($locale, 'vc.micStart')
+								: t($locale, 'vc.micIdle')}
 						>
 							<svg
 								class="h-14 w-14 sm:h-16 sm:w-16 text-slate-600"
@@ -683,7 +796,7 @@
 					{#if status === 'listening'}
 						<span
 							class="absolute bottom-1 right-1 h-3.5 w-3.5 rounded-full bg-emerald-500 ring-2 ring-white shadow"
-							title="연결됨"
+							title={t($locale, 'vc.connected')}
 							aria-hidden="true"
 						></span>
 					{/if}
@@ -704,19 +817,21 @@
 					></span>
 					<span>
 						{#if status === 'connecting'}
-							연결하는 중입니다…
+							{t($locale, 'vc.statusConnecting')}
 						{:else if status === 'listening' && engine === 'free' && freeBusy}
-							답변을 준비하거나 읽는 중이에요…
+							{freePhase === 'speaking'
+								? t($locale, 'vc.statusFreeSpeaking')
+								: t($locale, 'vc.statusFreeGenerating')}
 						{:else if status === 'listening'}
 							{#if isUserSpeaking}
-								말씀을 듣고 있어요…
+								{t($locale, 'vc.statusListening')}
 							{:else}
-								대화 준비 완료 - 자유롭게 말해보세요!
+								{t($locale, 'vc.statusReady')}
 							{/if}
 						{:else if status === 'error'}
-							문제가 발생했습니다. 아래 안내를 확인해 주세요.
+							{t($locale, 'vc.statusError')}
 						{:else}
-							마이크 버튼을 눌러 연결을 시작하세요.
+							{t($locale, 'vc.statusIdle')}
 						{/if}
 					</span>
 				</div>
@@ -728,7 +843,7 @@
 						disabled={status !== 'listening' && status !== 'connecting'}
 						onclick={() => stop()}
 					>
-						연결 해제
+						{t($locale, 'vc.disconnect')}
 					</button>
 					<button
 						type="button"
@@ -736,7 +851,7 @@
 						onclick={() => (showDebug = !showDebug)}
 					>
 						<span aria-hidden="true">🔧</span>
-						디버그
+						{t($locale, 'vc.debug')}
 					</button>
 				</div>
 
@@ -746,7 +861,7 @@
 					>
 						<p>engine: {engine}</p>
 						<p>status: {status}</p>
-						<p>freeBusy: {freeBusy}</p>
+						<p>freeBusy: {freeBusy} phase: {freePhase ?? '—'}</p>
 						<p>
 							ws:
 							{ws == null
@@ -763,7 +878,9 @@
 						<p>messages: {messages.length}</p>
 						{#if engine === 'free'}
 							<label class="block space-y-1 not-italic font-sans text-slate-700">
-								<span class="text-[11px] uppercase tracking-wide text-slate-500">Ollama 모델</span>
+								<span class="text-[11px] uppercase tracking-wide text-slate-500"
+									>{t($locale, 'vc.ollamaModel')}</span
+								>
 								<input
 									class="w-full rounded border border-slate-200 px-2 py-1 text-xs font-mono"
 									bind:value={ollamaModel}
@@ -783,14 +900,14 @@
 			<div
 				class="flex items-center justify-between gap-2 border-b border-slate-100 px-4 py-3 bg-slate-50/80"
 			>
-				<h2 class="text-sm font-semibold text-slate-800">대화 기록</h2>
+				<h2 class="text-sm font-semibold text-slate-800">{t($locale, 'vc.logHeader')}</h2>
 				<button
 					type="button"
 					class="text-xs font-medium text-sky-700 hover:text-sky-900 disabled:opacity-40"
 					disabled={messages.length === 0 && !streamingText}
 					onclick={() => clearHistory()}
 				>
-					기록 지우기
+					{t($locale, 'vc.clearLog')}
 				</button>
 			</div>
 			<div class="max-h-[42vh] overflow-y-auto p-4 space-y-4">
@@ -804,12 +921,16 @@
 									? 'bg-violet-500'
 									: 'bg-slate-500'}"
 						>
-							{m.role === 'system' ? 'AI' : m.role === 'assistant' ? 'A' : '나'}
+							{m.role === 'system' ? 'AI' : m.role === 'assistant' ? 'A' : t($locale, 'vc.avatarUser')}
 						</div>
 						<div class="min-w-0 flex-1">
 							<div class="flex items-baseline gap-2 flex-wrap">
 								<span class="text-sm font-semibold text-slate-800">
-									{m.role === 'system' ? '시스템' : m.role === 'assistant' ? '어시스턴트' : '나'}
+									{m.role === 'system'
+										? t($locale, 'vc.roleSystem')
+										: m.role === 'assistant'
+											? t($locale, 'vc.roleAssistant')
+											: t($locale, 'vc.roleUser')}
 								</span>
 								<span class="text-xs text-slate-400 tabular-nums">{formatTime(m.ts)}</span>
 							</div>
@@ -826,8 +947,8 @@
 						</div>
 						<div class="min-w-0 flex-1">
 							<div class="flex items-baseline gap-2">
-								<span class="text-sm font-semibold text-slate-800">어시스턴트</span>
-								<span class="text-xs text-violet-500">입력 중…</span>
+								<span class="text-sm font-semibold text-slate-800">{t($locale, 'vc.roleAssistant')}</span>
+								<span class="text-xs text-violet-500">{t($locale, 'vc.typing')}</span>
 							</div>
 							<p class="mt-1 text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
 								{streamingText}
@@ -836,7 +957,7 @@
 					</div>
 				{/if}
 				{#if messages.length === 0 && !streamingText && status === 'idle'}
-					<p class="text-center text-sm text-slate-400 py-6">연결 후 대화 내용이 여기에 표시됩니다.</p>
+					<p class="text-center text-sm text-slate-400 py-6">{t($locale, 'vc.emptyLog')}</p>
 				{/if}
 			</div>
 		</div>
@@ -854,27 +975,25 @@
 						onclick={() =>
 							errorHelpUrl && window.open(errorHelpUrl, '_blank', 'noopener,noreferrer')}
 					>
-						관련 페이지 열기 (새 탭)
+						{t($locale, 'vc.errorLink')}
 					</button>
 				{/if}
 			</div>
 		{/if}
 
 		<p class="text-center text-xs text-slate-500 space-y-1">
-			<span class="block"
-				>마이크는 HTTPS 또는 localhost에서만 사용할 수 있습니다.</span
-			>
+			<span class="block">{t($locale, 'vc.micHttps')}</span>
 			{#if engine === 'free'}
 				<span class="block text-slate-600">
-					무료 모드: PC에
+					{t($locale, 'vc.footerFreeBefore')}
 					<a
 						href="https://ollama.com"
 						class="text-sky-700 underline underline-offset-2"
 						target="_blank"
 						rel="noopener noreferrer">Ollama</a
 					>
-					설치 후 터미널에서 <code class="text-slate-700">ollama pull {ollamaModel}</code> 로 모델을 받고 Ollama를
-					켜 두세요.
+					{t($locale, 'vc.footerFreeAfter')}<code class="text-slate-700">ollama pull {ollamaModel}</code
+					>{t($locale, 'vc.footerFreeAfter2')}
 				</span>
 			{/if}
 		</p>

@@ -19,6 +19,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const b = body as Record<string, unknown>;
 	const messages = b.messages;
 	const model = typeof b.model === 'string' && b.model.trim() ? b.model.trim() : 'llama3.2';
+	const stream = b.stream === true;
 
 	if (!Array.isArray(messages) || messages.length === 0) {
 		return json({ error: 'messages 배열이 필요합니다.' }, { status: 400 });
@@ -29,6 +30,9 @@ export const POST: RequestHandler = async ({ request }) => {
 		: DEFAULT_BASE
 	).replace(/\/$/, '');
 
+	/** Keeps spoken replies short so voice turns feel responsive. */
+	const ollamaOptions = { num_predict: 220 };
+
 	try {
 		const resp = await fetch(`${base}/api/chat`, {
 			method: 'POST',
@@ -36,9 +40,35 @@ export const POST: RequestHandler = async ({ request }) => {
 			body: JSON.stringify({
 				model,
 				messages,
-				stream: false
+				stream,
+				options: ollamaOptions
 			})
 		});
+
+		if (stream) {
+			if (!resp.ok) {
+				const data = (await resp.json().catch(() => ({}))) as { error?: string };
+				const detail = typeof data?.error === 'string' ? data.error : resp.statusText;
+				return json(
+					{
+						error:
+							`Ollama 요청 실패 (${resp.status}): ${detail}\n` +
+							`Ollama를 설치하고 실행했는지, 모델을 받았는지 확인하세요. (예: ollama pull ${model})`
+					},
+					{ status: 502 }
+				);
+			}
+			if (!resp.body) {
+				return json({ error: 'Ollama 스트림 본문이 없습니다.' }, { status: 502 });
+			}
+			return new Response(resp.body, {
+				headers: {
+					'Content-Type': 'application/x-ndjson; charset=utf-8',
+					'Cache-Control': 'no-cache',
+					Connection: 'keep-alive'
+				}
+			});
+		}
 
 		const data = (await resp.json().catch(() => ({}))) as {
 			message?: { content?: string };
